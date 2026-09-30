@@ -7,3 +7,5 @@ sdkconfig.old
 .devcontainer/*
 games/*
 temp/*
+*.log
+*.err

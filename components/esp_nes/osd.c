@@ -17,12 +17,14 @@
 #include <dirent.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <ctype.h>
 
 #include "esp_system.h"
 #include "nvs_flash.h"
 #include "esp_partition.h"
 #include "spi_flash_mmap.h"
 #include "esp_heap_caps.h"
+#include "driver/uart.h"
 
 static const char *TAG = "OSD";
 
@@ -92,8 +94,10 @@ static void app_osd_video_custom_blit(bitmap_t *primary, int num_dirties, rect_t
 /* USB functions */
 static void app_hid_init(void);
 
-/* Game selection */
+/* Game selection / auto start */
 static void app_lvgl_game_selection(void);
+static bool app_auto_select_game(void);
+static bool app_uart_rom_upload(void);
 /*******************************************************************************
 * Local variables
 *******************************************************************************/
@@ -143,6 +147,9 @@ static lv_obj_t * game_selection = NULL;
 /* SD card mount state and the path buffer used for the currently selected SD ROM. */
 static bool s_sd_mounted = false;
 static char s_sel_path[256];
+/* ROM 统一放在 SD 卡的 ROM 子目录下（/sdcard/ROM/），不占 SD 卡根目录。 */
+#define ROM_DIR         BSP_SD_MOUNT_POINT "/ROM"
+static void app_rom_dir_ensure(void);
 
 /* Base pointer + ownership flag for the ROM buffer returned by osd_getromdata().
 ** nofrendo skips the 16-byte header before storing rominfo->rom, so rom_free()
@@ -262,7 +269,8 @@ int osd_init(void)
    esp_err_t sd_err = bsp_sdcard_mount();
    if (sd_err == ESP_OK) {
       s_sd_mounted = true;
-      ESP_LOGI(TAG, "SD card mounted at %s", BSP_SD_MOUNT_POINT);
+      app_rom_dir_ensure();
+      ESP_LOGI(TAG, "SD card mounted at %s (ROM dir: %s)", BSP_SD_MOUNT_POINT, ROM_DIR);
    } else {
       ESP_LOGW(TAG, "SD card mount failed (%s) - using flashed partitions only",
                esp_err_to_name(sd_err));
@@ -275,8 +283,15 @@ int osd_init(void)
    lv_obj_center(lvgl_video_canvas);
    bsp_display_unlock();
 
-	/* Show selection of the game */
-	app_lvgl_game_selection();
+	/* 开机直接进入游戏：优先 SD 上第一个 English ROM，其次第一个 .nes，再其次分区。 */
+	if (!app_auto_select_game()) {
+		/* SD 已挂载但没有任何 ROM -> 通过串口收 ROM，收到后重启自动加载。 */
+		if (s_sd_mounted && app_uart_rom_upload()) {
+			esp_restart();
+		}
+		/* 仍然没有 ROM：回到点选界面（会显示 NO ROM 提示） */
+		app_lvgl_game_selection();
+	}
 
 	return 0;
 }
@@ -451,7 +466,7 @@ static void app_lvgl_btn_qbert(lv_event_t *e)
 static void app_lvgl_btn_sd(lv_event_t *e)
 {
    const char *fn = (const char *)lv_event_get_user_data(e);
-   snprintf(s_sel_path, sizeof(s_sel_path), "%s/%s", BSP_SD_MOUNT_POINT, fn);
+   snprintf(s_sel_path, sizeof(s_sel_path), "%s/%s", ROM_DIR, fn);
    app_selected_game = s_sel_path;
    lv_obj_del(game_selection);
 }
@@ -504,6 +519,286 @@ static const char *app_rom_display_name(const uint8_t *hdr, int slot)
     return name;
 }
 
+/*******************************************************************************
+* 自动选择 ROM（开机直接进入游戏，不再显示点选界面）
+*******************************************************************************/
+
+#define MAX_ROM_FILES   32
+#define ROM_NAME_LEN    128
+
+/* 确保 /sdcard/ROM 存在，不存在则创建。 */
+static void app_rom_dir_ensure(void)
+{
+   struct stat st;
+   if (stat(ROM_DIR, &st) != 0) {
+      if (mkdir(ROM_DIR, 0777) != 0) {
+         ESP_LOGW(TAG, "mkdir %s failed", ROM_DIR);
+      }
+   }
+}
+
+/* newlib 不保证提供 strcasestr，这里自带大小写不敏感的子串匹配。 */
+static bool app_ci_contains(const char *hay, const char *needle)
+{
+   if (!*needle) {
+      return true;
+   }
+   for (const char *p = hay; *p; p++) {
+      if (tolower((unsigned char)*p) != tolower((unsigned char)*needle)) {
+         continue;
+      }
+      const char *a = p + 1;
+      const char *b = needle + 1;
+      while (*b && tolower((unsigned char)*a) == tolower((unsigned char)*b)) {
+         a++;
+         b++;
+      }
+      if (!*b) {
+         return true;
+      }
+   }
+   return false;
+}
+
+/* 枚举 SD 卡 ROM 目录下的 *.nes 并按字母序排序，返回数量。 */
+static int app_scan_sd_roms(char names[MAX_ROM_FILES][ROM_NAME_LEN])
+{
+   int n = 0;
+   DIR *d = opendir(ROM_DIR);
+   if (!d) {
+      return 0;
+   }
+   struct dirent *ent;
+   while ((ent = readdir(d)) != NULL && n < MAX_ROM_FILES) {
+      const char *nm = ent->d_name;
+      size_t l = strlen(nm);
+      if (l < 5 || l >= ROM_NAME_LEN) {
+         continue;
+      }
+      if (strcasecmp(nm + l - 4, ".nes") != 0) {
+         continue;
+      }
+      /* 上面已保证 l < ROM_NAME_LEN，故含 NUL 的拷贝不会越界。 */
+      memcpy(names[n], nm, l + 1);
+      n++;
+   }
+   closedir(d);
+
+   /* 插入排序：readdir 顺序取决于 FAT 目录项，排序后选择结果才稳定。 */
+   for (int i = 1; i < n; i++) {
+      char tmp[ROM_NAME_LEN];
+      memcpy(tmp, names[i], ROM_NAME_LEN);
+      int j = i - 1;
+      while (j >= 0 && strcasecmp(names[j], tmp) > 0) {
+         memcpy(names[j + 1], names[j], ROM_NAME_LEN);
+         j--;
+      }
+      memcpy(names[j + 1], tmp, ROM_NAME_LEN);
+   }
+   return n;
+}
+
+/* 选出一个 ROM 并写入 app_selected_game。成功返回 true。
+ * 优先级：SD 上文件名含 "english" 的 .nes > SD 上字母序第一个 .nes > 含有效 NES 头的分区。 */
+static bool app_auto_select_game(void)
+{
+   static char names[MAX_ROM_FILES][ROM_NAME_LEN];
+
+   if (s_sd_mounted) {
+      int n = app_scan_sd_roms(names);
+      if (n > 0) {
+         int pick = 0;
+         for (int i = 0; i < n; i++) {
+            if (app_ci_contains(names[i], "english")) {
+               pick = i;
+               break;
+            }
+         }
+         snprintf(s_sel_path, sizeof(s_sel_path), "%s/%s", ROM_DIR, names[pick]);
+         app_selected_game = s_sel_path;
+         ESP_LOGI(TAG, "Auto-start: %s (%d ROM(s) on SD)", s_sel_path, n);
+         return true;
+      }
+   }
+
+   /* 回退：烧录在 data 分区里的裸 .nes */
+   for (int i = 0; i < MAX_GAMES; i++) {
+      const esp_partition_t *part = esp_partition_find_first(
+          ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, GAME_PARTS[i]);
+      if (!part) {
+         continue;
+      }
+      uint8_t hdr[4];
+      if (esp_partition_read(part, 0, hdr, sizeof(hdr)) != ESP_OK) {
+         continue;
+      }
+      if (!(hdr[0] == 'N' && hdr[1] == 'E' && hdr[2] == 'S' && hdr[3] == 0x1A)) {
+         continue;
+      }
+      app_selected_game = GAME_PARTS[i];
+      ESP_LOGI(TAG, "Auto-start: partition %s", GAME_PARTS[i]);
+      return true;
+   }
+
+   return false;
+}
+
+/*******************************************************************************
+* 串口 ROM 上传（SD 卡上没有任何 ROM 时，通过 UART0 写入 SD 卡）
+*
+* 协议（PC 端 -> 设备，行以 \n 结尾）：
+*   "ROM <name> <size>\n"  -> 设备回 "READY <name>\n" -> PC 发送 <size> 字节裸数据
+*                          -> 设备回 "OK <name> <size>\n"
+*   "DONE\n"               -> 设备回 "REBOOT\n" 并重启
+*******************************************************************************/
+
+#define ROM_UPLOAD_BAUD     115200
+#define ROM_UPLOAD_CHUNK    4096
+#define ROM_UPLOAD_IDLE_MS  30000
+
+/* 读一行（不含换行符）；超时或读到空行返回 false。 */
+static bool app_uart_read_line(char *line, size_t max, uint32_t timeout_ms)
+{
+   size_t n = 0;
+   uint8_t c;
+   while (n + 1 < max) {
+      if (uart_read_bytes(UART_NUM_0, &c, 1, pdMS_TO_TICKS(timeout_ms)) != 1) {
+         line[n] = 0;
+         return false;
+      }
+      if (c == '\n' || c == '\r') {
+         line[n] = 0;
+         return n > 0;
+      }
+      line[n++] = (char)c;
+   }
+   line[n] = 0;
+   return true;
+}
+
+/* 接收单个文件并写入 /sdcard/<name>。 */
+static bool app_uart_recv_one(const char *name, size_t size)
+{
+   /* 只接受根目录下的简单文件名，避免路径穿越。 */
+   for (const char *p = name; *p; p++) {
+      char c = *p;
+      if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+            c == '_' || c == '-' || c == '.' || c == ' ')) {
+         printf("ERR bad name\n");
+         return false;
+      }
+   }
+   if (size == 0 || size > (64UL * 1024 * 1024)) {
+      printf("ERR bad size %u\n", (unsigned)size);
+      return false;
+   }
+
+   char path[ROM_NAME_LEN + 24];
+   snprintf(path, sizeof(path), "%s/%s", ROM_DIR, name);
+
+   FILE *fp = fopen(path, "wb");
+   if (!fp) {
+      printf("ERR open %s\n", path);
+      return false;
+   }
+
+   uint8_t *buf = heap_caps_malloc(ROM_UPLOAD_CHUNK, MALLOC_CAP_8BIT);
+   if (!buf) {
+      fclose(fp);
+      printf("ERR oom\n");
+      return false;
+   }
+
+   size_t remain = size;
+   bool ok = true;
+   while (remain > 0) {
+      size_t want = remain > ROM_UPLOAD_CHUNK ? ROM_UPLOAD_CHUNK : remain;
+      int rd = uart_read_bytes(UART_NUM_0, buf, want, pdMS_TO_TICKS(ROM_UPLOAD_IDLE_MS));
+      if (rd <= 0) {
+         printf("ERR timeout (%u bytes left)\n", (unsigned)remain);
+         ok = false;
+         break;
+      }
+      if (fwrite(buf, 1, rd, fp) != (size_t)rd) {
+         printf("ERR write sd\n");
+         ok = false;
+         break;
+      }
+      remain -= rd;
+   }
+
+   free(buf);
+   fclose(fp);
+
+   if (ok) {
+      printf("OK %s %u\n", name, (unsigned)size);
+   } else {
+      remove(path);
+   }
+   return ok;
+}
+
+/* SD 卡已挂载但没有 ROM 时调用：通过串口接收 ROM，收到后返回 true 由调用方重启。 */
+static bool app_uart_rom_upload(void)
+{
+   uart_config_t cfg = {
+      .baud_rate = ROM_UPLOAD_BAUD,
+      .data_bits = UART_DATA_8_BITS,
+      .parity = UART_PARITY_DISABLE,
+      .stop_bits = UART_STOP_BITS_1,
+      .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+      .source_clk = UART_SCLK_DEFAULT,
+   };
+
+   /* tx_buffer_size = 0：TX 继续由 printf 直接使用，driver 只接管 RX。 */
+   esp_err_t err = uart_driver_install(UART_NUM_0, 16384, 0, 0, NULL, 0);
+   if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+      ESP_LOGE(TAG, "uart driver install failed: %s", esp_err_to_name(err));
+      return false;
+   }
+   uart_param_config(UART_NUM_0, &cfg);
+   uart_set_pin(UART_NUM_0, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE,
+                UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+   uart_flush_input(UART_NUM_0);
+   app_rom_dir_ensure();
+
+   printf("\n=== NO ROM IN %s ===\n", ROM_DIR);
+   printf("Send \"ROM <name> <size>\\n\", wait for \"READY\", then <size> raw bytes.\n");
+   printf("Send \"DONE\\n\" to finish and reboot.\n");
+   printf("READY-FOR-UART-ROM\n");
+   fflush(stdout);
+   vTaskDelay(pdMS_TO_TICKS(200));
+
+   int got = 0;
+   char line[ROM_NAME_LEN + 32];
+   while (app_uart_read_line(line, sizeof(line), ROM_UPLOAD_IDLE_MS)) {
+      if (0 == strncmp(line, "DONE", 4)) {
+         printf("REBOOT\n");
+         fflush(stdout);
+         vTaskDelay(pdMS_TO_TICKS(300));
+         esp_restart();
+      }
+      if (0 == strncmp(line, "ROM ", 4)) {
+         char name[ROM_NAME_LEN];
+         unsigned long size = 0;
+         if (2 != sscanf(line + 4, "%127s %lu", name, &size)) {
+            printf("ERR bad cmd: %s\n", line);
+            continue;
+         }
+         printf("READY %s\n", name);
+         fflush(stdout);
+         if (app_uart_recv_one(name, (size_t)size)) {
+            got++;
+         }
+         continue;
+      }
+      /* 未知行忽略（例如 PC 端残留的输出） */
+   }
+
+   ESP_LOGW(TAG, "UART ROM upload idle timeout (%d file(s) received)", got);
+   return got > 0;
+}
+
 /* 三个按钮回调按分区顺序固定对应 nesrom1/2/3 */
 static void (*const game_cbs[MAX_GAMES])(lv_event_t *) = {
     app_lvgl_btn_supermario, app_lvgl_btn_donkeykong, app_lvgl_btn_qbert
@@ -553,7 +848,7 @@ static void app_lvgl_game_selection(void)
 
     /* Primary: list *.nes files from the SD card. */
     if (s_sd_mounted) {
-        DIR *d = opendir(BSP_SD_MOUNT_POINT);
+        DIR *d = opendir(ROM_DIR);
         if (d) {
             struct dirent *ent;
             while ((ent = readdir(d)) != NULL) {
@@ -606,7 +901,7 @@ static void app_lvgl_game_selection(void)
     if (found == 0) {
         lv_obj_t *none = lv_label_create(games);
         lv_obj_set_style_text_color(none, lv_color_white(), 0);
-        lv_label_set_text_static(none, "NO ROM FOUND\nPut .nes files on SD (/sdcard)\nor flash into nesrom1/2/3");
+        lv_label_set_text_static(none, "NO ROM FOUND\nPut .nes files in " ROM_DIR " on SD\nor flash into nesrom1/2/3");
     } else if (main_group) {
         lv_indev_set_group(indev, main_group);
         ESP_LOGI(TAG, "Game selection ready (%d ROMs).", found);
