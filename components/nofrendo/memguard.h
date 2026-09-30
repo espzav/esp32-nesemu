@@ -46,15 +46,25 @@ extern char *_my_strdup(const char *string, char *file, int line);
 #else /* !NORFRENDO_DEBUG */
 
 /* Non-debugging versions of calls */
+#ifdef malloc
+#undef malloc
+#endif
 #define  malloc(s)   _my_malloc(s)
-//#define  free(d)     free(d);d=NULL
+#ifdef strdup
+#undef strdup
+#endif
 #define  strdup(s)   _my_strdup((s))
 
-#define free(d) \
-    do { \
-        free(d); \
-        d = NULL; \
-    } while (0)
+/* In non-debug builds we route malloc/strdup through heap_caps-aware
+ * wrappers (_my_malloc / _my_strdup). `free` is intentionally NOT
+ * redefined here: some toolchains / IDF headers predefine `free` as a
+ * macro, and redefining it is a hard error under C23 (gcc reports
+ * "expected declaration specifiers or '(' before '(' token"). The real
+ * libc `free` is fully compatible with memory returned by
+ * heap_caps_malloc(MALLOC_CAP_DEFAULT) on ESP32, so leaving `free` as the
+ * system free is both safe and correct. We still #undef any predefined
+ * `free` macro so callers resolve to the real function. */
+#undef free   /* drop any predefined free macro so callers hit libc free */
 
 extern void *_my_malloc(size_t size);
 extern void _my_free(void **data);

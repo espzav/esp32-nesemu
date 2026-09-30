@@ -503,10 +503,19 @@ void rom_free(rominfo_t **rominfo)
 
    rom_savesram(*rominfo);
 
+   /* Free the original ROM buffer base (osd_getromdata may return a malloc'd
+   ** buffer whose base nofrendo has offset past the 16-byte header). */
+   if (osd_rom_owned && osd_rom_base)
+   {
+      free(osd_rom_base);
+      osd_rom_base = NULL;
+      osd_rom_owned = false;
+   }
+   else if ((*rominfo)->rom)
+      free((*rominfo)->rom);
+
    if ((*rominfo)->sram)
       free((*rominfo)->sram);
-   if ((*rominfo)->rom)
-      free((*rominfo)->rom);
    if ((*rominfo)->vrom)
       free((*rominfo)->vrom);
    if ((*rominfo)->vram)

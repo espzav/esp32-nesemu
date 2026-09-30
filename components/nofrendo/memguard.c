@@ -357,7 +357,7 @@ void _my_free(void **data)
       ASSERT_MSG(fail);
    }
 
-   free(*data);
+   heap_caps_free(*data);
    *data = NULL; /* NULL our source */
 }
 

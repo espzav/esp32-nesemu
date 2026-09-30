@@ -261,7 +261,7 @@ esp_err_t hid_class_request_set_idle(hid_host_device_handle_t hid_dev_handle,
  * @return esp_err_t
  */
 esp_err_t hid_class_request_set_protocol(hid_host_device_handle_t hid_dev_handle,
-        uint8_t protocol);
+        hid_report_protocol_t protocol);
 
 #ifdef __cplusplus
 }

@@ -51,11 +51,15 @@ typedef  unsigned short uint16;
 typedef  unsigned int   uint32;
 
 #ifndef __cplusplus
+/* C23 (gnu23 及以上) 已将 bool/true/false 作为语言关键字原生提供，
+** 此时再 typedef 会与关键字冲突，故仅在更早标准下保留自定枚举。 */
+#if __STDC_VERSION__ < 202311L
 typedef enum
 {
    false = 0,
    true = 1
 } bool;
+#endif
 
 #ifndef  NULL
 #define  NULL     ((void *) 0)
