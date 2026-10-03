@@ -32,6 +32,7 @@
 #include "nes6502.h"
 #include <log.h>
 #include <nes_mmc.h>
+#include "subor_keyboard.h"   /* 小霸王/学习机 Subor 键盘外设 */
 
 #include <bitmap.h>
 #include <vid_drv.h>
@@ -294,6 +295,9 @@ void ppu_writehigh(uint32 address, uint8 value)
       break;
 
    case PPU_JOY0:
+      /* 学习机键盘：把 $4016 写透传给 Subor 键盘外设（在 value 被 &1 破坏前） */
+      subor_kb_write(0x4016, value);
+
       /* VS system VROM switching - bleh!*/
       if (ppu.vromswitch)
          ppu.vromswitch(value);
@@ -328,10 +332,14 @@ uint8 ppu_readhigh(uint32 address)
       break;
 
    case PPU_JOY1:
-      /* TODO: better input handling */
-      value = input_get(INP_ZAPPER | INP_JOYPAD1 
-                        /*| INP_ARKANOID*/ 
-                        /*| INP_POWERPAD*/);
+      /* 学习机键盘启用时，$4017 由 Subor 键盘矩阵"占用"（与 KeyBoardSubor 行为一致）；
+       * 标准 NES 手柄仍走 $4016。普通 ROM 未接键盘时回退到原 joypad 读取。 */
+      if (subor_kb_is_enabled())
+         value = subor_kb_read(0x4017);
+      else
+         value = input_get(INP_ZAPPER | INP_JOYPAD1
+                           /*| INP_ARKANOID*/
+                           /*| INP_POWERPAD*/);
       break;
 
    default:

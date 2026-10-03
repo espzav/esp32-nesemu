@@ -2,3 +2,6 @@ description: NES Emulator
 
 dependencies:
   idf: ">=5.0"
+  espressif/usb: "*"
+  esp32_s31_korvo_1:
+    version: "*"

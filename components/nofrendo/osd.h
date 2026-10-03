@@ -92,6 +92,12 @@ extern char *osd_newextension(char *string, char *ext);
 extern void osd_getinput(void);
 extern void osd_getmouse(int *x, int *y, int *button);
 
+/* ROM buffer ownership: osd_getromdata() may return a malloc'd buffer whose
+** base differs from the pointer nofrendo stores in rominfo->rom (it skips the
+** 16-byte header). rom_free() uses these to free the correct base. */
+extern void *osd_rom_base;
+extern bool osd_rom_owned;
+
 /* build a filename for a snapshot, return -ve for error */
 extern int osd_makesnapname(char *filename, int len);
 

@@ -1,8 +1,8 @@
 file(GLOB_RECURSE T_SOURCES *.c)
-file(GLOB_RECURSE IMAGES images/*.c)
 
 idf_component_register(
-    SRCS ${T_SOURCES} ${IMAGES}
+    SRCS ${T_SOURCES}
     INCLUDE_DIRS "."
-    PRIV_REQUIRES driver nofrendo hid nvs_flash
+    REQUIRES esp32_s31_korvo_1
+    PRIV_REQUIRES driver esp_driver_uart nofrendo hid subor_keyboard nvs_flash spi_flash esp_lcd esp_timer
 )
