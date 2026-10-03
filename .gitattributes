@@ -1,0 +1,13 @@
+# 文本文件统一使用 LF 行尾：提交时归一化，检出时强制 LF。
+# 不依赖本地 core.autocrlf，保证所有平台（Windows/Mac/Linux）一致。
+* text=auto eol=lf
+
+# 二进制资产：禁止行尾转换，禁止文本 diff，避免数据损坏。
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.gif binary
+*.bin binary
+*.elf binary
+*.nes binary
