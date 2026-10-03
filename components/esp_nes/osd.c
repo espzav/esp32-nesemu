@@ -24,6 +24,7 @@
 #include "esp_partition.h"
 #include "spi_flash_mmap.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "driver/uart.h"
 
 static const char *TAG = "OSD";
@@ -97,7 +98,16 @@ static void app_hid_init(void);
 /* Game selection / auto start */
 static void app_lvgl_game_selection(void);
 static bool app_auto_select_game(void);
-static bool app_uart_rom_upload(void);
+static bool app_random_pick_game(void);
+static bool app_uart_rom_upload(uint32_t first_idle_ms);
+static void app_uart_wait_progress(const char *name, size_t got, size_t total);
+static bool s_uart_wait_transferring = false;
+static void app_autostart_begin(void);
+static void app_autostart_cancel(void);
+static void app_menu_destroy(void);
+/* 串口上传在独立任务里跑（阻塞读 UART），避免冻结 LVGL 任务使界面卡住。
+ * auto_sniff=true 为开机自动嗅探(短超时)，false 为按钮手动触发(长超时)。 */
+static void app_uart_upload_task(void *arg);
 /*******************************************************************************
 * Local variables
 *******************************************************************************/
@@ -150,6 +160,30 @@ static char s_sel_path[256];
 /* ROM 统一放在 SD 卡的 ROM 子目录下（/sdcard/ROM/），不占 SD 卡根目录。 */
 #define ROM_DIR         BSP_SD_MOUNT_POINT "/ROM"
 static void app_rom_dir_ensure(void);
+
+/* 开机选单 + 倒计时自动启动：若用户不点任何按钮，AUTOSTART_SEC 秒后自动启动
+** app_auto_select_game() 选中的游戏（SD-English 优先）。任一按钮点击都会取消倒计时。
+** 选单上还提供"串口收 ROM"按钮，可在不擦除分区的前提下把 .nes 存进 /sdcard/ROM/。 */
+#define AUTOSTART_SEC   8
+static const char *s_auto_pick = NULL;   /* 自动启动候选：SD 路径(s_auto_path) 或分区标签 */
+static char s_auto_path[256];            /* s_auto_pick 指向的 SD 路径缓冲 */
+static lv_timer_t *s_autostart_timer = NULL;
+static lv_obj_t *s_autostart_label = NULL;
+static lv_obj_t *s_uart_btn = NULL;   /* 挂在屏幕根上的 UART ROM 按钮 */
+static int s_autostart_left = 0;
+/* 串口接收互斥：同一时刻只允许一个任务读 UART0 RX（开机嗅探 or 按钮触发），避免抢数据。 */
+static volatile bool s_uart_rx_busy = false;
+/* 用户已通过菜单选定游戏（点了某个游戏按钮）：嗅探超时后不再自动启动，直接进游戏。 */
+static volatile bool s_user_picked_game = false;
+
+/* 串口 ROM 上传参数（定义提前，供上传任务与接收函数共用）。 */
+#define ROM_UPLOAD_BAUD     115200
+#define ROM_UPLOAD_CHUNK    4096
+#define ROM_UPLOAD_IDLE_MS  30000
+/* 开机自动进入串口接收等待的时长：此窗口内收到 ROM 命令则上传，否则超时自动启动游戏。 */
+#define BOOT_UART_WAIT_MS   8000
+/* 已有游戏时的开机嗅探窗口：只给一个"热更新"机会，短一点以免开机白等太久。 */
+#define BOOT_UART_HOT_WINDOW_MS  3000
 
 /* Base pointer + ownership flag for the ROM buffer returned by osd_getromdata().
 ** nofrendo skips the 16-byte header before storing rominfo->rom, so rom_free()
@@ -283,14 +317,26 @@ int osd_init(void)
    lv_obj_center(lvgl_video_canvas);
    bsp_display_unlock();
 
-	/* 开机直接进入游戏：优先 SD 上第一个 English ROM，其次第一个 .nes，再其次分区。 */
-	if (!app_auto_select_game()) {
-		/* SD 已挂载但没有任何 ROM -> 通过串口收 ROM，收到后重启自动加载。 */
-		if (s_sd_mounted && app_uart_rom_upload()) {
-			esp_restart();
+	/* 开机流程：显示选单菜单后，只要SD 已挂载就启动"开机嗅探"任务：
+	** 开机自动进入串口接收等待(BOOT_UART_WAIT_MS)，无需人工点按钮。
+	**   - 窗口内收到 PC 的 ROM 命令 -> 上传 -> 重启 -> 自动加载新 ROM；
+	**   - 窗口超时无指令 -> 若有候选游戏则自动启动(SD-English优先)，开机即玩；
+	**     若一个 ROM 都没有，则停在选单(保留 UART ROM 按钮)等待人工/再次上传。
+	**   - 用户在菜单点了某个游戏 -> 标记 s_user_picked_game，嗅探超时也不覆盖。
+	** 无 SD 时无法嗅探/上传：有候选则倒计时自动启动，无候选则停在选单。 */
+	bool have_auto = app_auto_select_game();
+	app_lvgl_game_selection();
+	if (s_sd_mounted) {
+		/* 关键：只要 SD 在就自动嗅探，覆盖"首次传 ROM"场景。
+		 * 有无候选都启动——没候选时嗅探超时不会自动启动任何东西，
+		 * 只是回到菜单等待，符合预期。 */
+		xTaskCreate(app_uart_upload_task, "uart_sniff", 4096, (void *)1, 4, NULL);
+		if (!have_auto) {
+			ESP_LOGI(TAG, "No ROM yet. Waiting for UART ROM upload (auto sniff) ...");
 		}
-		/* 仍然没有 ROM：回到点选界面（会显示 NO ROM 提示） */
-		app_lvgl_game_selection();
+	} else if (have_auto) {
+		/* 无 SD(无法嗅探/上传)：直接进入倒计时自动启动。 */
+		app_autostart_begin();
 	}
 
 	return 0;
@@ -445,30 +491,68 @@ int osd_makesnapname(char *filename, int len)
 * Private API functions
 *******************************************************************************/
 
+/* 删除整个选单界面（含挂在屏幕根上的 UART 按钮与倒计时标签）。
+ * 可在 LVGL 任务（按钮回调/定时器回调，锁内）调用。 */
+static void app_menu_destroy(void)
+{
+   if (game_selection) {
+      lv_obj_del(game_selection);
+      game_selection = NULL;
+   }
+   if (s_uart_btn) {
+      lv_obj_del(s_uart_btn);
+      s_uart_btn = NULL;
+   }
+   /* 倒计时标签由 app_autostart_cancel() 负责，这里兜底防泄漏 */
+   if (s_autostart_label) {
+      lv_obj_del(s_autostart_label);
+      s_autostart_label = NULL;
+   }
+}
+
 static void app_lvgl_btn_supermario(lv_event_t *e)
 {
-   lv_obj_del(game_selection);
+   s_user_picked_game = true;
+   app_autostart_cancel();
+   app_menu_destroy();
    app_selected_game = "nesrom1";
 }
 
 static void app_lvgl_btn_donkeykong(lv_event_t *e)
 {
-   lv_obj_del(game_selection);
+   s_user_picked_game = true;
+   app_autostart_cancel();
+   app_menu_destroy();
    app_selected_game = "nesrom2";
 }
 
 static void app_lvgl_btn_qbert(lv_event_t *e)
 {
-   lv_obj_del(game_selection);
+   s_user_picked_game = true;
+   app_autostart_cancel();
+   app_menu_destroy();
    app_selected_game = "nesrom3";
 }
 
 static void app_lvgl_btn_sd(lv_event_t *e)
 {
+   s_user_picked_game = true;
+   app_autostart_cancel();
    const char *fn = (const char *)lv_event_get_user_data(e);
    snprintf(s_sel_path, sizeof(s_sel_path), "%s/%s", ROM_DIR, fn);
    app_selected_game = s_sel_path;
-   lv_obj_del(game_selection);
+   app_menu_destroy();
+}
+
+/* "串口收 ROM"按钮：在独立任务里阻塞收文件并写入 /sdcard/ROM/，完成后重启自动加载。
+ * arg=NULL -> 手动触发模式（长超时 30s 等用户发指令）。 */
+static void app_lvgl_btn_uart_upload(lv_event_t *e)
+{
+   s_user_picked_game = true;   /* 手动收 ROM，不再走开机自动启动 */
+   app_autostart_cancel();
+   ESP_LOGI(TAG, "UART ROM upload requested from menu");
+   app_menu_destroy();
+   xTaskCreate(app_uart_upload_task, "uart_rom", 4096, NULL, 4, NULL);
 }
 
 static void app_lvgl_btn_reset(lv_event_t *e)
@@ -492,6 +576,138 @@ static void app_lvgl_add_game_btn(lv_obj_t *games, lv_group_t *main_group,
    if (main_group) {
       lv_group_add_obj(main_group, btn);
    }
+}
+
+/* ---- 倒计时自动启动 -------------------------------------------------------- */
+
+/* 倒计时到点或用户取消时调用：真正设置 app_selected_game 让 osd_getromdata() 放行。 */
+static void app_autostart_launch(void)
+{
+   if (app_selected_game == NULL && s_auto_pick != NULL) {
+      app_selected_game = s_auto_pick;
+   }
+   if (game_selection) {
+      lv_obj_del(game_selection);
+      game_selection = NULL;
+   }
+   if (s_uart_btn) {
+      lv_obj_del(s_uart_btn);
+      s_uart_btn = NULL;
+   }
+}
+
+/* LVGL 定时器回调（LVGL 任务、锁内）：刷新倒计时文案，到 0 则自动启动。 */
+static void app_autostart_timer_cb(lv_timer_t *t)
+{
+   if (--s_autostart_left > 0) {
+      if (s_autostart_label) {
+         char buf[48];
+         snprintf(buf, sizeof(buf), "Auto-start in %d s", s_autostart_left);
+         lv_label_set_text(s_autostart_label, buf);
+      }
+      return;
+   }
+   /* 到点：删掉倒计时定时器与标签，然后自动启动候选游戏 */
+   lv_timer_del(t);
+   s_autostart_timer = NULL;
+   if (s_autostart_label) {
+      lv_obj_del(s_autostart_label);
+      s_autostart_label = NULL;
+   }
+   ESP_LOGI(TAG, "Auto-start countdown finished -> %s", s_auto_pick ? s_auto_pick : "(none)");
+   app_autostart_launch();
+}
+
+/* 取消倒计时（用户点击了某个按钮）。可在 LVGL 任务（锁内）调用。 */
+static void app_autostart_cancel(void)
+{
+   if (s_autostart_timer) {
+      lv_timer_del(s_autostart_timer);
+      s_autostart_timer = NULL;
+   }
+   if (s_autostart_label) {
+      lv_obj_del(s_autostart_label);
+      s_autostart_label = NULL;
+   }
+   s_autostart_left = 0;
+}
+
+/* 开始倒计时自动启动（menu 已显示、有 auto 候选时调用）。
+ * 可能从 app_main 任务（osd_init）或上传任务调用，故自行持有 LVGL 锁；lvgl 锁是
+ * 递归互斥量，重入安全。 */
+static void app_autostart_begin(void)
+{
+   if (!s_auto_pick) {
+      return;
+   }
+   bsp_display_lock(0);
+   s_autostart_left = AUTOSTART_SEC;
+   s_autostart_timer = lv_timer_create(app_autostart_timer_cb, 1000, NULL);
+   bsp_display_unlock();
+}
+
+/* ---- 串口 ROM 上传任务 ---------------------------------------------------- */
+
+/* 串口接收任务。sniff=true：开机自动嗅探(短超时 BOOT_UART_WAIT_MS)，超时后若用户
+ * 没选游戏则自动启动候选游戏；sniff=false：按钮手动触发(长超时)，超时回菜单。
+ * 两种模式都收到文件后重启，让固件按 SD-English 优先规则自动加载。 */
+static void app_uart_upload_task(void *arg)
+{
+   bool sniff = (arg != NULL);
+   if (s_uart_rx_busy) {
+      /* 已有接收任务在跑（如嗅探中），放弃本次。 */
+      vTaskDelete(NULL);
+      return;
+   }
+   s_uart_rx_busy = true;
+
+   ESP_LOGI(TAG, "UART ROM upload task started (sniff=%d)", sniff);
+   /* 嗅探窗口自适应：已有游戏 -> 短热更新窗口(BOOT_UART_HOT_WINDOW_MS)快速自动启动；
+    * 无游戏 -> 长窗口(BOOT_UART_WAIT_MS)等待首次上传。手动触发固定用长超时。 */
+   uint32_t first_idle;
+   if (!sniff) {
+      first_idle = ROM_UPLOAD_IDLE_MS;
+   } else {
+      first_idle = (s_auto_pick != NULL) ? BOOT_UART_HOT_WINDOW_MS : BOOT_UART_WAIT_MS;
+   }
+   bool got = app_uart_rom_upload(first_idle);
+   s_uart_rx_busy = false;
+
+   if (got) {
+      ESP_LOGI(TAG, "UART ROM upload done, rebooting");
+      vTaskDelay(pdMS_TO_TICKS(300));
+      esp_restart();
+   }
+
+   if (sniff) {
+      /* 开机嗅探窗口内没有收到任何 ROM 命令：
+       * - 用户已在菜单点了某个游戏 -> 尊重用户选择，直接进游戏；
+       * - 否则自动启动候选游戏(SD-English 优先)；若无候选则随机挑一个；
+       * - 一个 ROM 都没有 -> 停在选单(保留 UART ROM 按钮)提示上传。 */
+      if (!s_user_picked_game) {
+         if (s_auto_pick == NULL) {
+            /* 没有 English/首选候选，随机挑一个可玩到的游戏。 */
+            app_random_pick_game();
+         }
+         if (s_auto_pick != NULL) {
+            ESP_LOGI(TAG, "Boot sniff idle -> auto-start %s", s_auto_pick);
+            app_selected_game = s_auto_pick;
+         } else {
+            ESP_LOGW(TAG, "Boot sniff idle: no ROM available, stay in menu for upload");
+         }
+      }
+      vTaskDelete(NULL);
+      return;
+   }
+
+   ESP_LOGW(TAG, "UART ROM upload idle timeout, back to menu");
+   /* 按钮触发超时：回到选单界面，让用户可再试或选游戏；若有候选游戏则恢复倒计时。
+    * app_lvgl_game_selection() 内部自行处理 LVGL 锁，此处不重复加锁。 */
+   app_lvgl_game_selection();
+   if (s_auto_pick) {
+      app_autostart_begin();
+   }
+   vTaskDelete(NULL);
 }
 
 /* 从 NES 头（偏移 0x10 起 16 字节）取 ROM 名称字段；若全部可打印则作为显示名，
@@ -598,11 +814,41 @@ static int app_scan_sd_roms(char names[MAX_ROM_FILES][ROM_NAME_LEN])
    return n;
 }
 
-/* 选出一个 ROM 并写入 app_selected_game。成功返回 true。
- * 优先级：SD 上文件名含 "english" 的 .nes > SD 上字母序第一个 .nes > 含有效 NES 头的分区。 */
+/* 随机回退：从 SD 卡里所有 .nes 中随机挑一个作为自动启动候选。
+ * 分区里一般不存 ROM，故这里只读 SD（与 app_auto_select_game 的扫描范围一致）。
+ * 用于"SD 为空且上传窗口超时"等场景——让设备总能玩到某个游戏。
+ * 找到返回 true 并写 s_auto_pick，否则返回 false（SD 上一个 ROM 都没有）。 */
+static bool app_random_pick_game(void)
+{
+   static char names[MAX_ROM_FILES][ROM_NAME_LEN];
+   static char paths[MAX_ROM_FILES][ROM_NAME_LEN + 32];
+   int n = 0;
+
+   if (s_sd_mounted) {
+      n = app_scan_sd_roms(names);
+   }
+
+   if (n == 0) {
+      s_auto_pick = NULL;
+      return false;
+   }
+
+   /* 用时间低位做伪随机种子，在候选里随机挑一个。 */
+   int pick = (int)(esp_timer_get_time() % n);
+   snprintf(paths[pick], sizeof(paths[pick]), "%s/%s", ROM_DIR, names[pick]);
+   s_auto_pick = paths[pick];
+   ESP_LOGI(TAG, "Random pick: %s (from %d SD candidate(s))", s_auto_pick, n);
+   return true;
+}
+
+/* 选出一个 ROM 作为"自动启动候选"，写入 s_auto_pick（SD 路径或分区标签）。
+ * 优先级：SD 上文件名含 "english" 的 .nes > SD 上字母序第一个 .nes > 含有效 NES 头的分区。
+ * 不直接设置 app_selected_game —— 由倒计时定时器或用户点击来最终启动。 */
 static bool app_auto_select_game(void)
 {
    static char names[MAX_ROM_FILES][ROM_NAME_LEN];
+
+   s_auto_pick = NULL;
 
    if (s_sd_mounted) {
       int n = app_scan_sd_roms(names);
@@ -614,9 +860,9 @@ static bool app_auto_select_game(void)
                break;
             }
          }
-         snprintf(s_sel_path, sizeof(s_sel_path), "%s/%s", ROM_DIR, names[pick]);
-         app_selected_game = s_sel_path;
-         ESP_LOGI(TAG, "Auto-start: %s (%d ROM(s) on SD)", s_sel_path, n);
+         snprintf(s_auto_path, sizeof(s_auto_path), "%s/%s", ROM_DIR, names[pick]);
+         s_auto_pick = s_auto_path;
+         ESP_LOGI(TAG, "Auto-start candidate: %s (%d ROM(s) on SD)", s_auto_path, n);
          return true;
       }
    }
@@ -635,8 +881,8 @@ static bool app_auto_select_game(void)
       if (!(hdr[0] == 'N' && hdr[1] == 'E' && hdr[2] == 'S' && hdr[3] == 0x1A)) {
          continue;
       }
-      app_selected_game = GAME_PARTS[i];
-      ESP_LOGI(TAG, "Auto-start: partition %s", GAME_PARTS[i]);
+      s_auto_pick = GAME_PARTS[i];
+      ESP_LOGI(TAG, "Auto-start candidate: partition %s", GAME_PARTS[i]);
       return true;
    }
 
@@ -651,10 +897,6 @@ static bool app_auto_select_game(void)
 *                          -> 设备回 "OK <name> <size>\n"
 *   "DONE\n"               -> 设备回 "REBOOT\n" 并重启
 *******************************************************************************/
-
-#define ROM_UPLOAD_BAUD     115200
-#define ROM_UPLOAD_CHUNK    4096
-#define ROM_UPLOAD_IDLE_MS  30000
 
 /* 读一行（不含换行符）；超时或读到空行返回 false。 */
 static bool app_uart_read_line(char *line, size_t max, uint32_t timeout_ms)
@@ -711,6 +953,9 @@ static bool app_uart_recv_one(const char *name, size_t size)
 
    size_t remain = size;
    bool ok = true;
+   /* 开始接收：切换等待窗口到"传输中"状态并刷新初始进度。 */
+   s_uart_wait_transferring = true;
+   app_uart_wait_progress(name, 0, size);
    while (remain > 0) {
       size_t want = remain > ROM_UPLOAD_CHUNK ? ROM_UPLOAD_CHUNK : remain;
       int rd = uart_read_bytes(UART_NUM_0, buf, want, pdMS_TO_TICKS(ROM_UPLOAD_IDLE_MS));
@@ -725,7 +970,9 @@ static bool app_uart_recv_one(const char *name, size_t size)
          break;
       }
       remain -= rd;
+      app_uart_wait_progress(name, size - remain, size);
    }
+   s_uart_wait_transferring = false;
 
    free(buf);
    fclose(fp);
@@ -738,8 +985,143 @@ static bool app_uart_recv_one(const char *name, size_t size)
    return ok;
 }
 
-/* SD 卡已挂载但没有 ROM 时调用：通过串口接收 ROM，收到后返回 true 由调用方重启。 */
-static bool app_uart_rom_upload(void)
+/* 串口收 ROM 等待期间的全屏提示窗口：替代原先"只有串口文本提示、屏上无反馈"的
+ * 局面，让用户在屏上直接看到"正在等上传"。进入窗口调用 app_uart_wait_show()，
+ * 退出(收到文件/超时)调用 app_uart_wait_hide()。mode 区分首次上传与热更新文案。 */
+static lv_obj_t *s_uart_wait_win = NULL;
+static lv_obj_t *s_uart_wait_dots_lbl = NULL;
+static lv_obj_t *s_uart_wait_bar = NULL;
+static lv_obj_t *s_uart_wait_prog_lbl = NULL;
+static lv_timer_t *s_uart_wait_timer = NULL;
+static int s_uart_wait_dots = 0;
+
+static void app_uart_wait_anim_cb(lv_timer_t *t)
+{
+   (void)t;
+   if (!s_uart_wait_dots_lbl) {
+      return;
+   }
+   /* 传输进行中由 app_uart_wait_progress 接管状态行，动画让位。 */
+   if (s_uart_wait_transferring) {
+      return;
+   }
+   /* 旋转的点，提示界面在等待而非卡死。 */
+   static const char *frames[4] = { "   ", ".  ", ".. ", "..." };
+   char buf[64];
+   snprintf(buf, sizeof(buf), "Waiting for UART ROM%s", frames[s_uart_wait_dots]);
+   s_uart_wait_dots = (s_uart_wait_dots + 1) & 3;
+   lv_label_set_text(s_uart_wait_dots_lbl, buf);
+}
+
+static void app_uart_wait_show(const char *mode)
+{
+   bsp_display_lock(0);
+   /* 清理现有菜单/按钮，独占整屏。(s_autostart_label 不动——自动启动倒计时定时器
+    * 仍可能引用它，删除会悬空；它会被下方全屏窗口盖住，菜单重建时再处理。) */
+   if (game_selection) {
+      lv_obj_del(game_selection);
+      game_selection = NULL;
+   }
+   if (s_uart_btn) {
+      lv_obj_del(s_uart_btn);
+      s_uart_btn = NULL;
+   }
+   lv_obj_set_style_bg_color(lv_scr_act(), lv_color_black(), 0);
+
+   s_uart_wait_win = lv_obj_create(lv_scr_act());
+   lv_obj_set_size(s_uart_wait_win, BSP_LCD_H_RES, BSP_LCD_V_RES);
+   lv_obj_set_style_bg_color(s_uart_wait_win, lv_color_black(), 0);
+   lv_obj_set_style_border_width(s_uart_wait_win, 0, 0);
+   lv_obj_clear_flag(s_uart_wait_win, LV_OBJ_FLAG_SCROLLABLE);
+   lv_obj_align(s_uart_wait_win, LV_ALIGN_CENTER, 0, 0);
+
+   lv_obj_t *cont = lv_obj_create(s_uart_wait_win);
+   lv_obj_set_style_bg_color(cont, lv_color_black(), 0);
+   lv_obj_set_style_border_width(cont, 0, 0);
+   lv_obj_set_size(cont, BSP_LCD_H_RES - 80, BSP_LCD_V_RES - 80);
+   lv_obj_center(cont);
+   lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
+   lv_obj_set_flex_align(cont, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+   lv_obj_set_style_pad_row(cont, 14, 0);
+
+   lv_obj_t *title = lv_label_create(cont);
+   lv_obj_set_style_text_color(title, lv_color_white(), 0);
+   lv_label_set_text_static(title, "UART ROM UPLOAD");
+
+   s_uart_wait_dots_lbl = lv_label_create(cont);
+   lv_obj_set_style_text_color(s_uart_wait_dots_lbl, lv_color_white(), 0);
+   lv_label_set_text_static(s_uart_wait_dots_lbl, "Waiting for UART ROM ...");
+
+   s_uart_wait_bar = lv_bar_create(cont);
+   lv_obj_set_size(s_uart_wait_bar, 480, 22);
+   lv_bar_set_range(s_uart_wait_bar, 0, 100);
+   lv_bar_set_value(s_uart_wait_bar, 0, LV_ANIM_OFF);
+
+   s_uart_wait_prog_lbl = lv_label_create(cont);
+   lv_obj_set_style_text_color(s_uart_wait_prog_lbl, lv_color_make(0x5f, 0xd0, 0xff), 0);
+   lv_label_set_text_static(s_uart_wait_prog_lbl, "");
+
+   lv_obj_t *hint = lv_label_create(cont);
+   lv_obj_set_style_text_color(hint, lv_color_make(0x9a, 0x9a, 0x9a), 0);
+   lv_label_set_text_static(hint, mode);
+
+   lv_obj_t *cmd = lv_label_create(cont);
+   lv_obj_set_style_text_color(cmd, lv_color_make(0x5f, 0xd0, 0xff), 0);
+   lv_label_set_text_static(cmd,
+                           "PC:  ROM <name> <size>\\n"
+                           "     wait READY, send raw bytes\\n"
+                           "     DONE to reboot");
+
+   s_uart_wait_timer = lv_timer_create(app_uart_wait_anim_cb, 400, NULL);
+   bsp_display_unlock();
+}
+
+static void app_uart_wait_hide(void)
+{
+   bsp_display_lock(0);
+   s_uart_wait_transferring = false;
+   if (s_uart_wait_timer) {
+      lv_timer_del(s_uart_wait_timer);
+      s_uart_wait_timer = NULL;
+   }
+   if (s_uart_wait_win) {
+      lv_obj_del(s_uart_wait_win);
+      s_uart_wait_win = NULL;
+   }
+   s_uart_wait_dots_lbl = NULL;
+   s_uart_wait_bar = NULL;
+   s_uart_wait_prog_lbl = NULL;
+   bsp_display_unlock();
+}
+
+/* 传输进行中更新等待窗口：显示正在传的 ROM 名称与进度(百分比 + 字节数)。
+ * 由 app_uart_recv_one 在接收循环里周期性调用。 */
+static void app_uart_wait_progress(const char *name, size_t got, size_t total)
+{
+   bsp_display_lock(0);
+   if (s_uart_wait_dots_lbl) {
+      char s[80];
+      snprintf(s, sizeof(s), "Receiving: %s", name);
+      lv_label_set_text(s_uart_wait_dots_lbl, s);
+   }
+   if (s_uart_wait_bar) {
+      int pct = total ? (int)((uint64_t)got * 100 / total) : 0;
+      lv_bar_set_value(s_uart_wait_bar, pct, LV_ANIM_OFF);
+   }
+   if (s_uart_wait_prog_lbl) {
+      char s[80];
+      snprintf(s, sizeof(s), "%u / %u bytes (%d%%)",
+               (unsigned)got, (unsigned)total,
+               total ? (int)((uint64_t)got * 100 / total) : 0);
+      lv_label_set_text(s_uart_wait_prog_lbl, s);
+   }
+   bsp_display_unlock();
+}
+
+/* SD 卡已挂载时可通过串口接收 ROM。first_idle_ms 为等待第一个 ROM 命令的超时：
+ * 开机自动嗅探传 BOOT_UART_WAIT_MS(短)，手动按钮触发传 ROM_UPLOAD_IDLE_MS(长)。
+ * 收到并传完文件返回 true，由调用方重启。 */
+static bool app_uart_rom_upload(uint32_t first_idle_ms)
 {
    uart_config_t cfg = {
       .baud_rate = ROM_UPLOAD_BAUD,
@@ -762,16 +1144,37 @@ static bool app_uart_rom_upload(void)
    uart_flush_input(UART_NUM_0);
    app_rom_dir_ensure();
 
-   printf("\n=== NO ROM IN %s ===\n", ROM_DIR);
+   /* 横幅按"是否已有游戏"区分措辞：已有游戏时这是热更新窗口，否则是首次上传窗口。 */
+   if (s_auto_pick != NULL) {
+      printf("\n=== UART ROM WINDOW (已有游戏 %s，留可热更新) ===\n", s_auto_pick);
+   } else {
+      printf("\n=== NO ROM IN %s (等待上传) ===\n", ROM_DIR);
+   }
    printf("Send \"ROM <name> <size>\\n\", wait for \"READY\", then <size> raw bytes.\n");
    printf("Send \"DONE\\n\" to finish and reboot.\n");
    printf("READY-FOR-UART-ROM\n");
    fflush(stdout);
    vTaskDelay(pdMS_TO_TICKS(200));
 
+   /* 屏上显示等待窗口（替代单纯串口文本），让用户在屏上看到"正在等上传"。 */
+   char wait_mode[96];
+   if (s_auto_pick != NULL) {
+      snprintf(wait_mode, sizeof(wait_mode),
+               "Hot-update: SD already has a game.\nSend a .nes to add / replace.");
+   } else {
+      snprintf(wait_mode, sizeof(wait_mode),
+               "No ROM yet. Send a .nes file to start playing.");
+   }
+   app_uart_wait_show(wait_mode);
+
    int got = 0;
    char line[ROM_NAME_LEN + 32];
-   while (app_uart_read_line(line, sizeof(line), ROM_UPLOAD_IDLE_MS)) {
+   /* first_idle_ms：等待"第一个 ROM 命令"的超时。开机自动嗅探用短超时(BOOT_UART_WAIT_MS)，
+    * 超时即返回 false 让主流程自动启动游戏；按钮手动触发用长超时(ROM_UPLOAD_IDLE_MS)。
+    * 一旦收到第一个 ROM 命令并开始接收，后续每包都用 ROM_UPLOAD_IDLE_MS(30s)，
+    * 保证 1MB ROM 的长时间传输不会被打断。 */
+   uint32_t idle = first_idle_ms;
+   while (app_uart_read_line(line, sizeof(line), idle)) {
       if (0 == strncmp(line, "DONE", 4)) {
          printf("REBOOT\n");
          fflush(stdout);
@@ -787,6 +1190,8 @@ static bool app_uart_rom_upload(void)
          }
          printf("READY %s\n", name);
          fflush(stdout);
+         /* 开始传输：切换到长超时，保证大文件传输不被打断 */
+         idle = ROM_UPLOAD_IDLE_MS;
          if (app_uart_recv_one(name, (size_t)size)) {
             got++;
          }
@@ -795,7 +1200,12 @@ static bool app_uart_rom_upload(void)
       /* 未知行忽略（例如 PC 端残留的输出） */
    }
 
-   ESP_LOGW(TAG, "UART ROM upload idle timeout (%d file(s) received)", got);
+   if (got > 0) {
+      ESP_LOGW(TAG, "UART ROM upload done (%d file(s))", got);
+   } else {
+      ESP_LOGW(TAG, "UART ROM upload: no command within idle window");
+   }
+   app_uart_wait_hide();
    return got > 0;
 }
 
@@ -807,6 +1217,17 @@ static void (*const game_cbs[MAX_GAMES])(lv_event_t *) = {
 static void app_lvgl_game_selection(void)
 {
     bsp_display_lock(0);
+    /* 若已存在旧菜单（例如上传超时后重建），先删除避免泄漏/重复。
+     * 重建前先取消倒计时，防止旧定时器指向已删除的标签。 */
+    app_autostart_cancel();
+    if (game_selection) {
+        lv_obj_del(game_selection);
+        game_selection = NULL;
+    }
+    if (s_uart_btn) {
+        lv_obj_del(s_uart_btn);
+        s_uart_btn = NULL;
+    }
     lv_obj_set_style_bg_color(lv_scr_act(), lv_color_black(), 0);
 
     /* 复位按钮（左上角） */
@@ -905,6 +1326,38 @@ static void app_lvgl_game_selection(void)
     } else if (main_group) {
         lv_indev_set_group(indev, main_group);
         ESP_LOGI(TAG, "Game selection ready (%d ROMs).", found);
+    }
+
+    /* 串口收 ROM 入口（仅 SD 已挂载时可用）：不擦除分区也能把 .nes 存进 SD。
+     * 挂在屏幕根上并绝对定位到底部：避开 game_selection 的 flex 布局与
+     * 480px 高度裁剪，确保按钮始终可见、可点。 */
+    if (s_sd_mounted) {
+        lv_obj_t *up = lv_btn_create(lv_scr_act());
+        lv_obj_set_size(up, 300, 60);
+        lv_obj_set_style_radius(up, 8, 0);
+        lv_obj_set_style_bg_color(up, lv_color_make(0x5f, 0x1f, 0x3a), 0);
+        lv_obj_t *upl = lv_label_create(up);
+        lv_obj_set_style_text_color(upl, lv_color_white(), 0);
+        lv_label_set_text_static(upl, "UART ROM -> " ROM_DIR);
+        lv_obj_center(upl);
+        lv_obj_add_event_cb(up, app_lvgl_btn_uart_upload, LV_EVENT_CLICKED, NULL);
+        lv_obj_align(up, LV_ALIGN_BOTTOM_MID, 0, -24);
+        lv_obj_move_foreground(up);
+        s_uart_btn = up;
+        if (main_group) {
+            lv_group_add_obj(main_group, up);
+        }
+    }
+
+    /* 倒计时提示标签（app_autostart_begin 会把剩余秒数写进来）。 */
+    if (s_auto_pick) {
+        char buf[48];
+        snprintf(buf, sizeof(buf), "Auto-start in %d s", AUTOSTART_SEC);
+        s_autostart_label = lv_label_create(lv_scr_act());
+        lv_obj_set_style_text_color(s_autostart_label, lv_color_white(), 0);
+        lv_label_set_text(s_autostart_label, buf);
+        lv_obj_align(s_autostart_label, LV_ALIGN_BOTTOM_MID, 0, -96);
+        lv_obj_move_foreground(s_autostart_label);
     }
 
     bsp_display_unlock();
